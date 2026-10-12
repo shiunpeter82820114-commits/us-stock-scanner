@@ -30,6 +30,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(b"Bot is running 24/7!")
 
+  def do_HEAD(self):
+    # 專門回應 UptimeRobot 的 HEAD 請求，避免被判定 501 錯誤
+    self.send_response(200)
+    self.end_headers()
+
   def log_message(self, format, *args):
     return
 
