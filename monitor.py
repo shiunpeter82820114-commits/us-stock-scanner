@@ -5,33 +5,24 @@ import threading
 import time
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 import numpy as np
 import pandas as pd
 import requests
 
-# ================= 1. 從雲端環境變數讀取金鑰 (保護隱私) =================
+# ================= 1. 從環境變數讀取金鑰 =================
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-WATCHLIST = [
-    "TSLA",
-    "NVDA",
-    "AMD",
-    "AAPL",
-    "MSFT",
-    "AMZN",
-    "QQQ",
-    "COIN",
-]
+WATCHLIST = ["TSLA", "NVDA", "AMD", "AAPL", "MSFT", "AMZN", "QQQ", "COIN"]
 last_alert_time = {}
 ALERT_COOLDOWN_SEC = 1800
 
 client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 
-# ================= 2. 滿足 Render 的輕量假伺服器 =================
+# ================= 2. 滿足 Render 的輕量 Web Server =================
 class HealthCheckHandler(BaseHTTPRequestHandler):
 
   def do_GET(self):
@@ -40,7 +31,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     self.wfile.write(b"Bot is running 24/7!")
 
   def log_message(self, format, *args):
-    return  # 關閉連線 log，保持終端機乾淨
+    return
 
 
 def start_web_server():
@@ -102,9 +93,7 @@ def evaluate_w_bottom(bars_df, tolerance=0.015):
   curr_vwap = vwap[-1]
   prev_close = closes[-2]
   is_recent = (len(lows) - 1 - l2_idx) <= 3
-  cross_vwap = (
-      curr_close >= curr_vwap and prev_close <= curr_vwap * 1.002
-  )
+  cross_vwap = curr_close >= curr_vwap and prev_close <= curr_vwap * 1.002
 
   if is_recent and cross_vwap and curr_close < peak:
     return True, {
@@ -117,9 +106,10 @@ def evaluate_w_bottom(bars_df, tolerance=0.015):
 
 
 def run_scan_cycle():
+  # 修正：最新版 alpaca-py 的 5 分 K 正確寫法
   req = StockBarsRequest(
       symbol_or_symbols=WATCHLIST,
-      timeframe=TimeFrame.Minute(5),
+      timeframe=TimeFrame(5, TimeFrameUnit.Minute),
       limit=50,
   )
   try:
@@ -128,9 +118,12 @@ def run_scan_cycle():
     print(f"API 請求失敗: {e}")
     return
 
+  # 兼容量化物件與 dict 結構
+  bars_dict = bars_data.data if hasattr(bars_data, "data") else bars_data
   now = time.time()
+
   for ticker in WATCHLIST:
-    bars = bars_data.get(ticker, [])
+    bars = bars_dict.get(ticker, [])
     if not bars:
       continue
     df = pd.DataFrame([
@@ -152,11 +145,8 @@ def run_scan_cycle():
 
 
 if __name__ == "__main__":
-  # 1. 在背景 thread 啟動微型 Web Server (供 Render 連線檢查)
   threading.Thread(target=start_web_server, daemon=True).start()
   print("美股短線 W 底雲端監控中...")
-
-  # 2. 5 分鐘定時輪詢
   while True:
     run_scan_cycle()
     time.sleep(300)
