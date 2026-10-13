@@ -151,7 +151,13 @@ def run_scan_cycle():
 
 if __name__ == "__main__":
   threading.Thread(target=start_web_server, daemon=True).start()
-  print("美股短線 W 底雲端監控中...")
+  print("美股短線 W 底雲端監控中...", flush=True)
+
   while True:
     run_scan_cycle()
+    print(
+        f"[{datetime.now().strftime('%H:%M:%S')}] 完成一輪 5分K"
+        " 掃描，等待下一根收線...",
+        flush=True,
+    )
     time.sleep(300)
