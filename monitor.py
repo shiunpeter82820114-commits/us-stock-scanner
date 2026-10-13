@@ -15,7 +15,7 @@ ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-# 美股市值與流動性前 50 大標的
+# 美股市值與流動性前 50 大標的清單
 WATCHLIST = [
     # 科技與半導體巨頭
     "AAPL",
@@ -91,6 +91,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     )
 
   def do_HEAD(self):
+    # 專門回應 UptimeRobot 的 HEAD 請求，避免被誤判 DOWN
     self.send_response(200)
     self.end_headers()
 
@@ -130,16 +131,19 @@ def send_discord_alert(ticker, l1, l2, current_price, vwap, vol_ratio=1.0):
 
 
 def calculate_intraday_vwap(df):
-  """修正：每日開盤重置累計值的真正日內 VWAP"""
+  """修正：每日開盤重置累加值的真正日內 VWAP"""
   data = df.copy()
   data["timestamp"] = pd.to_datetime(data["timestamp"])
-  dates = data["timestamp"].dt.date
+  data["date"] = data["timestamp"].dt.date
 
-  typical_price = (data["high"] + data["low"] + data["close"]) / 3
-  typical_vol = typical_price * data["volume"]
+  # 算出典型價格與成交金額
+  data["typical_price"] = (data["high"] + data["low"] + data["close"]) / 3
+  data["tp_vol"] = data["typical_price"] * data["volume"]
 
-  data["cum_vol"] = data.groupby(dates)["volume"].cumsum()
-  data["cum_tp_vol"] = data.groupby(dates)[typical_vol].cumsum()
+  # 依當日分組累加，避免跨日累加偏差
+  data["cum_vol"] = data.groupby("date")["volume"].cumsum()
+  data["cum_tp_vol"] = data.groupby("date")["tp_vol"].cumsum()
+
   data["vwap"] = np.where(
       data["cum_vol"] > 0, data["cum_tp_vol"] / data["cum_vol"], data["close"]
   )
@@ -153,7 +157,7 @@ def evaluate_w_bottom(bars_df, tolerance=0.015):
   2. 頸線反彈超過 1.2%
   3. 右底在最近 15 分鐘內成型
   4. 當根 K 棒帶量（> 前5棒均量 1.15x）突破當日日內 VWAP
-  5. 尚未突破頸線（保留足夠風損空間）
+  5. 尚未追過頸線高點（保留足夠風損空間）
   """
   if len(bars_df) < 25:
     return False, None
@@ -174,104 +178,4 @@ def evaluate_w_bottom(bars_df, tolerance=0.015):
   # 2. 抓取反彈頸線高點 (至少反彈 1.2%)
   peak_idx = int(np.argmax(highs[l1_idx : len(highs) - 3])) + l1_idx
   peak = highs[peak_idx]
-  if (peak - l1) / l1 < 0.012:
-    return False, None
-
-  # 3. 抓取右底 L2 (回測誤差在 1.5% 內)
-  l2_idx = int(np.argmin(lows[peak_idx:])) + peak_idx
-  l2 = lows[l2_idx]
-  if abs(l2 - l1) / l1 > tolerance:
-    return False, None
-
-  curr_close = closes[-1]
-  curr_vwap = vwaps[-1]
-  prev_close = closes[-2]
-  curr_vol = volumes[-1]
-
-  # 計算前 5 根 K 棒的均量（不含當前突破棒）
-  prev_volumes = volumes[-6:-1]
-  avg_vol = np.mean(prev_volumes) if len(prev_volumes) > 0 else 0
-
-  # 4. 技術分析四大右側確認條件
-  is_recent = (len(lows) - 1 - l2_idx) <= 3  # 右底剛成型於 15 分鐘內
-  cross_vwap = (
-      curr_close >= curr_vwap and prev_close <= curr_vwap * 1.002
-  )  # 突破站上當日 VWAP
-  volume_confirmed = (
-      (curr_vol >= avg_vol * 1.15) if avg_vol > 0 else True
-  )  # 量能放大
-  not_overextended = curr_close < peak  # 尚未追過頸線
-
-  if is_recent and cross_vwap and volume_confirmed and not_overextended:
-    vol_ratio = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1.0
-    return True, {
-        "l1": l1,
-        "l2": l2,
-        "price": curr_close,
-        "vwap": curr_vwap,
-        "volume_ratio": vol_ratio,
-    }
-
-  return False, None
-
-
-def run_scan_cycle():
-  now = time.time()
-  chunk_size = 10
-  for i in range(0, len(WATCHLIST), chunk_size):
-    chunk = WATCHLIST[i : i + chunk_size]
-    req = StockBarsRequest(
-        symbol_or_symbols=chunk,
-        timeframe=TimeFrame(5, TimeFrameUnit.Minute),
-        limit=500,  # 10 檔 x 50 根棒線，確保數據充足
-    )
-    try:
-      bars_data = client.get_stock_bars(req)
-    except Exception as e:
-      print(f"批次查詢失敗 ({chunk[0]}...): {e}", flush=True)
-      continue
-
-    bars_dict = bars_data.data if hasattr(bars_data, "data") else bars_data
-
-    for ticker in chunk:
-      bars = bars_dict.get(ticker, [])
-      if not bars:
-        continue
-
-      df = pd.DataFrame([
-          {
-              "timestamp": b.timestamp,
-              "open": b.open,
-              "high": b.high,
-              "low": b.low,
-              "close": b.close,
-              "volume": b.volume,
-          }
-          for b in bars
-      ])
-
-      matched, info = evaluate_w_bottom(df)
-      if matched and now - last_alert_time.get(ticker, 0) > ALERT_COOLDOWN_SEC:
-        send_discord_alert(
-            ticker,
-            info["l1"],
-            info["l2"],
-            info["price"],
-            info["vwap"],
-            info["volume_ratio"],
-        )
-        last_alert_time[ticker] = now
-
-
-if __name__ == "__main__":
-  threading.Thread(target=start_web_server, daemon=True).start()
-  print("美股短線 W 底雲端監控啟動！監控標的：前 50 大股票", flush=True)
-
-  while True:
-    run_scan_cycle()
-    print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 完成前 50 大股票 5分K"
-        " 掃描，等待下一根收線...",
-        flush=True,
-    )
-    time.sleep(300)
+  if (peak - l1) / l1 < 0.0
