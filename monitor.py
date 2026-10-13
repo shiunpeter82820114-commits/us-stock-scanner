@@ -2,7 +2,7 @@ import os
 import time
 import threading
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import requests
 import pandas as pd
 import numpy as np
@@ -28,24 +28,32 @@ ALERT_COOLDOWN_SEC = 1800
 
 client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-# ================= 2. 滿足 Render 與 UptimeRobot 的 Web 服務 =================
+# ================= 2. 多執行緒 Web 服務 (徹底杜絕 502 堵塞) =================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(b"Bot is running 24/7! Technical Analysis Rules v2 Active.")
+        self.wfile.write(b"Bot is running 24/7! Technical Analysis Rules Active.")
 
     def do_HEAD(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Connection", "close")
         self.end_headers()
 
     def log_message(self, format, *args):
         return
 
 def start_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+    try:
+        port = int(os.environ.get("PORT", 10000))
+        # 使用 ThreadingHTTPServer 支援多節點同時敲門
+        server = ThreadingHTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        server.serve_forever()
+    except Exception as e:
+        print(f"Web 伺服器異常: {e}", flush=True)
 
 # ================= 3. 策略與推播邏輯 =================
 def send_discord_alert(ticker, l1, l2, current_price, vwap, vol_ratio=1.0):
@@ -83,53 +91,67 @@ def calculate_intraday_vwap(df):
     return data
 
 def evaluate_w_bottom(bars_df, tolerance=0.015):
-    if len(bars_df) < 25:
-        return False, None
-    
-    df = calculate_intraday_vwap(bars_df)
-    recent = df.tail(25).reset_index(drop=True)
-    
-    lows = recent["low"].values
-    highs = recent["high"].values
-    closes = recent["close"].values
-    vwaps = recent["vwap"].values
-    volumes = recent["volume"].values
-    
-    l1_idx = int(np.argmin(lows[3:15])) + 3
-    l1 = lows[l1_idx]
-    
-    peak_idx = int(np.argmax(highs[l1_idx:len(highs)-3])) + l1_idx
-    peak = highs[peak_idx]
-    if (peak - l1) / l1 < 0.012:
-        return False, None
-    
-    l2_idx = int(np.argmin(lows[peak_idx:])) + peak_idx
-    l2 = lows[l2_idx]
-    if abs(l2 - l1) / l1 > tolerance:
-        return False, None
+    try:
+        if len(bars_df) < 25:
+            return False, None
         
-    curr_close = closes[-1]
-    curr_vwap = vwaps[-1]
-    prev_close = closes[-2]
-    curr_vol = volumes[-1]
-    
-    prev_volumes = volumes[-6:-1]
-    avg_vol = np.mean(prev_volumes) if len(prev_volumes) > 0 else 0
-    
-    is_recent = (len(lows) - 1 - l2_idx) <= 3
-    cross_vwap = (curr_close >= curr_vwap) and (prev_close <= curr_vwap * 1.002)
-    volume_confirmed = (curr_vol >= avg_vol * 1.15) if avg_vol > 0 else True
-    not_overextended = curr_close < peak
-    
-    if is_recent and cross_vwap and volume_confirmed and not_overextended:
-        vol_ratio = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1.0
-        return True, {
-            "l1": l1,
-            "l2": l2,
-            "price": curr_close,
-            "vwap": curr_vwap,
-            "volume_ratio": vol_ratio
-        }
+        df = calculate_intraday_vwap(bars_df)
+        recent = df.tail(25).reset_index(drop=True)
+        
+        lows = recent["low"].values
+        highs = recent["high"].values
+        closes = recent["close"].values
+        vwaps = recent["vwap"].values
+        volumes = recent["volume"].values
+        
+        if len(lows) < 20:
+            return False, None
+            
+        l1_idx = int(np.argmin(lows[3:15])) + 3
+        l1 = lows[l1_idx]
+        
+        peak_slice = highs[l1_idx:len(highs)-3]
+        if len(peak_slice) == 0:
+            return False, None
+            
+        peak_idx = int(np.argmax(peak_slice)) + l1_idx
+        peak = highs[peak_idx]
+        if (peak - l1) / l1 < 0.012:
+            return False, None
+        
+        l2_slice = lows[peak_idx:]
+        if len(l2_slice) == 0:
+            return False, None
+            
+        l2_idx = int(np.argmin(l2_slice)) + peak_idx
+        l2 = lows[l2_idx]
+        if abs(l2 - l1) / l1 > tolerance:
+            return False, None
+            
+        curr_close = closes[-1]
+        curr_vwap = vwaps[-1]
+        prev_close = closes[-2]
+        curr_vol = volumes[-1]
+        
+        prev_volumes = volumes[-6:-1]
+        avg_vol = np.mean(prev_volumes) if len(prev_volumes) > 0 else 0
+        
+        is_recent = (len(lows) - 1 - l2_idx) <= 3
+        cross_vwap = (curr_close >= curr_vwap) and (prev_close <= curr_vwap * 1.002)
+        volume_confirmed = (curr_vol >= avg_vol * 1.15) if avg_vol > 0 else True
+        not_overextended = curr_close < peak
+        
+        if is_recent and cross_vwap and volume_confirmed and not_overextended:
+            vol_ratio = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+            return True, {
+                "l1": l1,
+                "l2": l2,
+                "price": curr_close,
+                "vwap": curr_vwap,
+                "volume_ratio": vol_ratio
+            }
+    except Exception:
+        return False, None
         
     return False, None
 
@@ -138,43 +160,50 @@ def run_scan_cycle():
     chunk_size = 10
     for i in range(0, len(WATCHLIST), chunk_size):
         chunk = WATCHLIST[i:i + chunk_size]
-        req = StockBarsRequest(
-            symbol_or_symbols=chunk,
-            timeframe=TimeFrame(5, TimeFrameUnit.Minute),
-            limit=500
-        )
         try:
+            req = StockBarsRequest(
+                symbol_or_symbols=chunk,
+                timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+                limit=500
+            )
             bars_data = client.get_stock_bars(req)
         except Exception as e:
-            print(f"批次查詢失敗 ({chunk[0]}...): {e}", flush=True)
+            print(f"API 請求逾時 ({chunk[0]}...): {e}", flush=True)
             continue
             
         bars_dict = bars_data.data if hasattr(bars_data, 'data') else bars_data
         
         for ticker in chunk:
-            bars = bars_dict.get(ticker, [])
-            if not bars:
-                continue
+            try:
+                bars = bars_dict.get(ticker, [])
+                if not bars:
+                    continue
+                    
+                df = pd.DataFrame([{
+                    "timestamp": b.timestamp,
+                    "open": b.open,
+                    "high": b.high,
+                    "low": b.low,
+                    "close": b.close,
+                    "volume": b.volume
+                } for b in bars])
                 
-            df = pd.DataFrame([{
-                "timestamp": b.timestamp,
-                "open": b.open,
-                "high": b.high,
-                "low": b.low,
-                "close": b.close,
-                "volume": b.volume
-            } for b in bars])
-            
-            matched, info = evaluate_w_bottom(df)
-            if matched and (now - last_alert_time.get(ticker, 0) > ALERT_COOLDOWN_SEC):
-                send_discord_alert(ticker, info["l1"], info["l2"], info["price"], info["vwap"], info["volume_ratio"])
-                last_alert_time[ticker] = now
+                matched, info = evaluate_w_bottom(df)
+                if matched and (now - last_alert_time.get(ticker, 0) > ALERT_COOLDOWN_SEC):
+                    send_discord_alert(ticker, info["l1"], info["l2"], info["price"], info["vwap"], info["volume_ratio"])
+                    last_alert_time[ticker] = now
+            except Exception:
+                continue
 
 if __name__ == "__main__":
-    threading.Thread(target=start_web_server, daemon=True).start()
-    print("美股短線 W 底雲端監控啟動！技術分析 v2 (當日VWAP + 放量確認) 運行中...", flush=True)
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+    print("美股短線 W 底雲端監控啟動！多執行緒 Web 伺服器已就緒...", flush=True)
     
     while True:
-        run_scan_cycle()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 完成前 50 大股票 5分K 掃描，等待下一根收線...", flush=True)
+        try:
+            run_scan_cycle()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 完成前 50 大股票 5分K 掃描，伺服器健康運行中...", flush=True)
+        except Exception as cycle_err:
+            print(f"掃描週期異常（已自動恢復）: {cycle_err}", flush=True)
         time.sleep(300)
