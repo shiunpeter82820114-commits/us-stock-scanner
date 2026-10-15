@@ -28,7 +28,7 @@ ALERT_COOLDOWN_SEC = 1800
 
 client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-# ================= 2. 多執行緒 Web 服務 (徹底杜絕 502 堵塞) =================
+# ================= 2. 多執行緒 Web 服務 (防止連線堵塞與 502) =================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -49,23 +49,38 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def start_web_server():
     try:
         port = int(os.environ.get("PORT", 10000))
-        # 使用 ThreadingHTTPServer 支援多節點同時敲門
         server = ThreadingHTTPServer(('0.0.0.0', port), HealthCheckHandler)
         server.serve_forever()
     except Exception as e:
         print(f"Web 伺服器異常: {e}", flush=True)
 
 # ================= 3. 策略與推播邏輯 =================
-def send_discord_alert(ticker, l1, l2, current_price, vwap, vol_ratio=1.0):
+def send_discord_alert(ticker, l1, l2, peak, current_price, vwap, vol_ratio=1.0):
     stop_loss = round(l2 * 0.998, 2)
+    risk = round(current_price - stop_loss, 2)
+    
+    # 技術分析目標價規劃
+    tp1 = round(peak, 2)                                 # 第一止盈：頸線反彈高點阻力
+    pattern_height = peak - l2                           # W底形態高度
+    tp2 = round(peak + pattern_height, 2)                # 第二止盈：突破頸線後的經典等距對稱測幅
+    
+    reward = round(tp2 - current_price, 2)
+    rr_ratio = round(reward / risk, 1) if risk > 0 else 0.0
+
     payload = {
         "content": (
             f"⚡ **【美股短線】W底右側啟動：{ticker}** ⚡\n"
             f"• 當前價格: `${current_price:.2f}`\n"
-            f"• 左底 (L1): `${l1:.2f}` | 右底 (L2): `${l2:.2f}`\n"
-            f"• 當日日內 VWAP: `${vwap:.2f}` (放量站上)\n"
+            f"• 雙底結構: 左底 (L1) `${l1:.2f}` | 右底 (L2) `${l2:.2f}`\n"
+            f"• 頸線價位: `${peak:.2f}` (反彈高點阻力)\n"
+            f"• 當日 VWAP: `${vwap:.2f}` (放量站上)\n"
             f"• 量能動態: 放量 `{vol_ratio}x` (突破量 > 前5棒均量)\n"
-            f"• 參考防守停損: `${stop_loss}` (跌破右底停損)\n"
+            f"-----------------------------------------\n"
+            f"🎯 **【操作建議與出場規劃】**\n"
+            f"• 🛑 防守停損 (SL): `${stop_loss}` (跌破右底停損)\n"
+            f"• 🚩 第一止盈 (TP1): `${tp1}` (頸線測試位，建議減倉或保本)\n"
+            f"• 🚀 測幅目標 (TP2): `${tp2}` (突破頸線等距滿足點)\n"
+            f"• 潛在風報比: `1 : {rr_ratio}`\n"
             f"• 觸發時間: {datetime.now().strftime('%H:%M:%S')}"
         )
     }
@@ -107,9 +122,11 @@ def evaluate_w_bottom(bars_df, tolerance=0.015):
         if len(lows) < 20:
             return False, None
             
+        # 1. 抓取左底 L1 (防呆切片)
         l1_idx = int(np.argmin(lows[3:15])) + 3
         l1 = lows[l1_idx]
         
+        # 2. 抓取反彈頸線高點 (確保區間非空)
         peak_slice = highs[l1_idx:len(highs)-3]
         if len(peak_slice) == 0:
             return False, None
@@ -119,6 +136,7 @@ def evaluate_w_bottom(bars_df, tolerance=0.015):
         if (peak - l1) / l1 < 0.012:
             return False, None
         
+        # 3. 抓取右底 L2
         l2_slice = lows[peak_idx:]
         if len(l2_slice) == 0:
             return False, None
@@ -146,6 +164,7 @@ def evaluate_w_bottom(bars_df, tolerance=0.015):
             return True, {
                 "l1": l1,
                 "l2": l2,
+                "peak": peak,
                 "price": curr_close,
                 "vwap": curr_vwap,
                 "volume_ratio": vol_ratio
@@ -190,7 +209,15 @@ def run_scan_cycle():
                 
                 matched, info = evaluate_w_bottom(df)
                 if matched and (now - last_alert_time.get(ticker, 0) > ALERT_COOLDOWN_SEC):
-                    send_discord_alert(ticker, info["l1"], info["l2"], info["price"], info["vwap"], info["volume_ratio"])
+                    send_discord_alert(
+                        ticker=ticker,
+                        l1=info["l1"],
+                        l2=info["l2"],
+                        peak=info["peak"],
+                        current_price=info["price"],
+                        vwap=info["vwap"],
+                        vol_ratio=info["volume_ratio"]
+                    )
                     last_alert_time[ticker] = now
             except Exception:
                 continue
